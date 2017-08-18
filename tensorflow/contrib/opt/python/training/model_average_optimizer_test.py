@@ -17,6 +17,11 @@ from tensorflow.python.training import server_lib
 from tensorflow.python.training import training
 from tensorflow.contrib.opt.python.training import model_average_optimizer
 
+import tensorflow as tf
+from tensorflow.contrib import slim
+from tensorflow.contrib.slim.python.slim.nets import resnet_utils
+from tensorflow.contrib.slim.python.slim.nets import resnet_v1
+
 
 def create_local_cluster(num_workers, num_ps, protocol="grpc"):
   """Create local GRPC servers and return them."""
@@ -141,6 +146,38 @@ class ModelAverageOptimizerTest(test.TestCase):
       self.assertDeviceEqual("/job:worker", w.device)
       self.assertDeviceEqual("/job:worker", w.initializer.device)
       self.assertDeviceEqual("/job:worker", a.device)
+
+  def testBadDeviceAssignment(self):
+    num_train_tasks = 3
+    num_ps_tasks = 2
+    with tf.Graph().as_default():
+      #with tf.device(model_average_optimizer.model_average_device_setter(num_ps_tasks)):
+      with ops.device(model_average_optimizer.model_average_device_setter(num_ps_tasks, cluster=self._cluster_spec)):
+        global_step = tf.train.get_or_create_global_step()
+        bs = 1
+        images = tf.zeros((bs, 32, 32, 3))
+        labels = tf.one_hot(tf.ones((bs), dtype=tf.int32), 10)
+        with slim.arg_scope(resnet_v1.resnet_arg_scope()):
+          logits, end_points = resnet_v1.resnet_v1_101(images, num_classes=10, is_training=True)
+          ce = tf.nn.softmax_cross_entropy_with_logits(labels=labels, logits=logits)
+          loss = tf.reduce_mean(ce)
+
+        base_opt = tf.train.GradientDescentOptimizer(0.01)
+        ma = model_average_optimizer.ModelAverageOptimizer(replicas_to_aggregate=num_train_tasks, interval_steps=100, use_nesterov=False)
+        ma_hook = ma.make_ma_run_hook()
+        is_chief = True
+        ma_replicas_hook = ma.make_session_run_hook(is_chief, num_tokens=num_train_tasks)
+
+        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+        with tf.control_dependencies(update_ops):
+          train_op = base_opt.minimize(loss, global_step=global_step)
+
+      with self.test_session() as sess:
+        _, loss_v = sess.run([train_op, loss])
+        print("loss_v", loss_v)
+
+
+
 
 if __name__ == "__main__":
   test.main()
