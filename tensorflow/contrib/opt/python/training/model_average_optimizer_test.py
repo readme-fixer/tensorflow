@@ -9,18 +9,22 @@ from __future__ import print_function
 import numpy as np
 import portpicker
 
-from tensorflow.python.framework import ops
-from tensorflow.python.ops import variables
-from tensorflow.python.ops import math_ops
-from tensorflow.python.platform import test
-from tensorflow.python.training import server_lib
-from tensorflow.python.training import training
+from tensorflow.contrib.framework.python.ops import arg_scope
 from tensorflow.contrib.opt.python.training import model_average_optimizer
-
-import tensorflow as tf
-from tensorflow.contrib import slim
 from tensorflow.contrib.slim.python.slim.nets import resnet_utils
 from tensorflow.contrib.slim.python.slim.nets import resnet_v1
+from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import ops
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import nn_ops
+from tensorflow.python.ops import variables
+from tensorflow.python.platform import test
+from tensorflow.python.training import coordinator
+from tensorflow.python.training import queue_runner_impl
+from tensorflow.python.training import server_lib
+from tensorflow.python.training import training
+from tensorflow.python.training import training_util
 
 
 def create_local_cluster(num_workers, num_ps, protocol="grpc"):
@@ -150,32 +154,41 @@ class ModelAverageOptimizerTest(test.TestCase):
   def testBadDeviceAssignment(self):
     num_train_tasks = 3
     num_ps_tasks = 2
-    with tf.Graph().as_default():
-      #with tf.device(model_average_optimizer.model_average_device_setter(num_ps_tasks)):
-      with ops.device(model_average_optimizer.model_average_device_setter(num_ps_tasks, cluster=self._cluster_spec)):
-        global_step = tf.train.get_or_create_global_step()
+    with ops.Graph().as_default():
+      ds = model_average_optimizer.model_average_device_setter(
+          self._cluster_spec.num_tasks("ps"),
+          cluster=self._cluster_spec)
+      with ops.device(ds):
+        global_step = training_util.get_or_create_global_step()
         bs = 1
-        images = tf.zeros((bs, 32, 32, 3))
-        labels = tf.one_hot(tf.ones((bs), dtype=tf.int32), 10)
-        with slim.arg_scope(resnet_v1.resnet_arg_scope()):
-          logits, end_points = resnet_v1.resnet_v1_101(images, num_classes=10, is_training=True)
-          ce = tf.nn.softmax_cross_entropy_with_logits(labels=labels, logits=logits)
-          loss = tf.reduce_mean(ce)
+        images = array_ops.zeros((bs, 32, 32, 3))
+        labels = array_ops.one_hot(array_ops.ones((bs), dtype=dtypes.int32), 10)
+        with arg_scope(resnet_v1.resnet_arg_scope()):
+          logits, end_points = resnet_v1.resnet_v1_101(images, num_classes=10,
+                                                       is_training=True)
+          ce = nn_ops.softmax_cross_entropy_with_logits(labels=labels,
+                                                        logits=logits)
+          loss = math_ops.reduce_mean(ce)
 
-        base_opt = tf.train.GradientDescentOptimizer(0.01)
-        ma = model_average_optimizer.ModelAverageOptimizer(replicas_to_aggregate=num_train_tasks, interval_steps=100, use_nesterov=False)
+        base_opt = training.GradientDescentOptimizer(0.01)
+        ma = model_average_optimizer.ModelAverageOptimizer(
+            replicas_to_aggregate=num_train_tasks, interval_steps=100,
+            use_nesterov=False)
         ma_hook = ma.make_ma_run_hook()
         is_chief = True
-        ma_replicas_hook = ma.make_session_run_hook(is_chief, num_tokens=num_train_tasks)
+        ma_replicas_hook = ma.make_session_run_hook(is_chief,
+                                                    num_tokens=num_train_tasks)
 
-        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-        with tf.control_dependencies(update_ops):
+        update_ops = ops.get_collection(ops.GraphKeys.UPDATE_OPS)
+        with ops.control_dependencies(update_ops):
           train_op = base_opt.minimize(loss, global_step=global_step)
 
       with self.test_session() as sess:
-        _, loss_v = sess.run([train_op, loss])
-        print("loss_v", loss_v)
-
+        coord = coordinator.Coordinator()
+        threads = queue_runner_impl.start_queue_runners()
+        sess.run(train_op)
+        coord.request_stop()
+        coord.join(threads)
 
 
 
